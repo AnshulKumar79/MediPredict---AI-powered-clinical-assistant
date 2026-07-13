@@ -1,180 +1,115 @@
 import os
-import io
-import base64
 import numpy as np
-import torch
-import torch.nn as nn
+import onnxruntime as ort
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from torchvision import models, transforms
 from PIL import Image
-from dotenv import load_dotenv
-
-
-load_dotenv()
-
-# Grad-CAM Tooling
-from pytorch_grad_cam import GradCAM
-from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
-from pytorch_grad_cam.utils.image import show_cam_on_image
-
-# Google Gemini API SDK
+import io
 import google.generativeai as genai
 
-app = FastAPI(
-    title="MediPredict_API",
-    description="Open triage backend combining PyTorch Vision, Grad-CAM, and Gemini LLM Clinical Synthesis.",
-    version="2.0"
-)
+# Initialize FastAPI
+app = FastAPI(title="MediPredict AI Lite", version="2.0")
 
-
+# Enable CORS so your frontend can communicate with it smoothly
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # Allows all web origins to make requests
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Initialize Hardware Environment (CPU optimized for web tasks)
-device = torch.device("cpu")
+# Configure Gemini
+genai.configure(api_key=os.getenv("GEMINI_API_KEY", ""))
 
-# Securely configure Gemini SDK using system environment configurations
-GEMINI_KEY = os.getenv("GEMINI_API_KEY")
-if GEMINI_KEY:
-    genai.configure(api_key=GEMINI_KEY)
-else:
-    print("Gemini API key not found")
+# Load ONNX session globally on startup to conserve memory
+# This uses ~100MB of RAM compared to PyTorch's ~350MB+ baseline
+try:
+    session = ort.InferenceSession("model.onnx", providers=['CPUExecutionProvider'])
+except Exception as e:
+    print(f"Error loading ONNX model: {e}")
+    session = None
 
-#NEURAL NETWORK ARCHITECTURE
-model = models.efficientnet_b0(weights=None)
-in_features = model.classifier[1].in_features
-model.classifier[1] = nn.Linear(in_features, 7)
-
-
-WEIGHTS_FILE = 'best_clinical_model_unfrozen.pth'
-if os.path.exists(WEIGHTS_FILE):
-    model.load_state_dict(torch.load(WEIGHTS_FILE, map_location=device))
-    model = model.to(device)
-    model.eval()
-    print(f"EfficientNet framework initialized with weights: {WEIGHTS_FILE}")
-else:
-    print(f"ERROR: Weights file '{WEIGHTS_FILE}' not found")
-
-# Prep specific Conv layers for structural tracking map extraction
-for param in model.features[-1].parameters():
-    param.requires_grad = True
-
-target_layers = [model.features[-1]]
-cam = GradCAM(model=model, target_layers=target_layers)
-
-# Standardize incoming visual formats to match training matrix parameters
-transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-])
-
-disease_map = {
-    0: ('akiec', "Actinic Keratoses / Intraepithelial Carcinoma (Pre-cancerous)"),
-    1: ('bcc', "Basal Cell Carcinoma (Malignant skin cancer)"),
+# HAM10000 Dataset Target Mapping
+DISEASE_MAP = {
+    0: ('akiec', "Actinic keratoses and Intraepithelial Carcinoma (Pre-cancerous)"),
+    1: ('bcc', "Basal Cell Carcinoma (Malignant)"),
     2: ('bkl', "Benign Keratosis-like Lesions (Non-cancerous)"),
-    3: ('df', "Dermatofibroma (Benign firm nodule)"),
-    4: ('mel', "Melanoma (Highly Malignant / Aggressive skin cancer)"),
+    3: ('df', "Dermatofibroma (Benign skin growth)"),
+    4: ('mel', "Melanoma (Highly Malignant)"),
     5: ('nv', "Melanocytic Nevi (Common Benign Mole)"),
-    6: ('vasc', "Vascular Lesions (Benign vascular cluster)")
+    6: ('vasc', "Vascular Lesions (Benign blood vessel cluster)")
 }
 
-#API Endpoint
-@app.post("/analyze")
-async def analyze_lesion_endpoint(
-    file: UploadFile = File(...),
-    symptoms: str = Form(...)  # Direct, open injection parsing
+@app.get("/")
+def health_check():
+    return {"status": "online", "model_loaded": session is not None}
+
+@app.post("/api/v2/analyze-lesion")
+async def analyze_lesion(
+    image: UploadFile = File(...),
+    symptoms: str = Form("None provided.")
 ):
-    if not file.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="The submitted asset must be a valid image format.")
-    
+    if not session:
+        raise HTTPException(status_code=500, detail="ONNX Model Engine is unavailable.")
+        
     try:
-        # Phase 1: Image Stream Deconstruction
-        image_bytes = await file.read()
-        raw_image = Image.open(io.BytesIO(image_bytes)).convert('RGB')
-        input_tensor = transform(raw_image).unsqueeze(0).to(device)
+        # 1. Read the incoming image file directly into memory bytes
+        image_bytes = await image.read()
+        pil_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         
-        # Phase 2: Core Vision Model Categorization
-        outputs = model(input_tensor)
-        probabilities = torch.nn.functional.softmax(outputs, dim=1)[0]
-        confidence, predicted_idx = torch.max(probabilities, 0)
+        # 2. Manual Matrix Preprocessing (Zero PyTorch dependencies)
+        img_resized = pil_image.resize((224, 224))
+        img_array = np.array(img_resized).astype(np.float32) / 255.0
         
-        class_id = predicted_idx.item()
-        short_code, diagnosis_label = disease_map[class_id]
-        confidence_pct = round(confidence.item() * 100, 2)
-        
-        # Phase 3: Spatial Heatmap Generation via Grad-CAM
-        targets = [ClassifierOutputTarget(class_id)]
-        grayscale_cam = cam(input_tensor=input_tensor, targets=targets)[0, :]
-        
-        # Reconstruct standard RGB backgrounds from un-normalized data slices
-        img_np = input_tensor.squeeze(0).permute(1, 2, 0).detach().numpy()
+        # Standard ImageNet normalization math
         mean = np.array([0.485, 0.456, 0.406])
         std = np.array([0.229, 0.224, 0.225])
-        rgb_img = np.clip(std * img_np + mean, 0, 1)
+        img_normalized = (img_array - mean) / std
         
-        cam_image = show_cam_on_image(rgb_img, grayscale_cam, use_rgb=True)
-        heatmap_pil = Image.fromarray((cam_image * 255).astype(np.uint8))
-        
-        buffered = io.BytesIO()
-        heatmap_pil.save(buffered, format="JPEG")
-        heatmap_base64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
-        
-        # Phase 4: Text Synthesis Generation via Gemini
-        prescribed_actions = "Gemini interface configuration inactive. Consult a primary healthcare facility immediately."
-        
-        if GEMINI_KEY:
-            try:
-                # Utilizing the Gemini 3.5 Flash architecture
-                llm_model = genai.GenerativeModel('gemini-3.5-flash')
-                
-                prompt = f"""
-                You are a professional medical triage support agent assisting with automated pre-screen checks.
-                An image analysis model evaluated a skin lesion and flagged:
-                - Suspected Classification: {diagnosis_label} ({short_code.upper()})
-                - Network Prediction Confidence: {confidence_pct}%
-                
-                The patient provided the following symptom context:
-                "{symptoms}"
-                
-                Compose a highly structured triage summary for the patient containing:
-                1. Context Analysis: Explain what the label implies in standard, non-alarmist terms.
-                2. Direct Symptoms Correlation: Connect their explicit self-reported description to the finding.
-                3. Prescribed Actions: Detail concrete next steps (monitoring guidelines, appointment advice).
-                4. Medical Disclaimer: State clearly that this automated assistant is not a replacement for a clinical treatment.
-                
-                Ensure the style is professional, easy to digest, and clean.
-                """
-                
-                response = llm_model.generate_content(prompt)
-                prescribed_actions = response.text
-                
-            except Exception as gemini_err:
-                prescribed_actions = f"Gemini system experienced an inline handling error: {str(gemini_err)}"
+        # Rearrange dims: HWC to CHW format & add batch axis -> (1, 3, 224, 224)
+        img_transposed = np.transpose(img_normalized, (2, 0, 1))
+        input_tensor = np.expand_dims(img_transposed, axis=0).astype(np.float32)
 
-        # Phase 5: Structured Return Package Data Object
-        return {
-            "status": "success",
-            "vision_insights": {
-                "detected_class_code": short_code.upper(),
-                "diagnosis_description": diagnosis_label,
-                "ai_confidence_percentage": confidence_pct
-            },
-            "explainable_ai": {
-                "heatmap_format": "image/jpeg",
-                "heatmap_image_base64": heatmap_base64
-            },
-            "clinical_triage": {
-                "user_reported_symptoms_received": symptoms,
-                "gemini_prescribed_actions": prescribed_actions
-            }
-        }
+        # 3. Run Inference via ONNX
+        onnx_inputs = {session.get_inputs()[0].name: input_tensor}
+        onnx_outputs = session.run(None, onnx_inputs)
+        raw_scores = onnx_outputs[0][0]
         
+        # Stable numerical Softmax calculation
+        exp_shifted = np.exp(raw_scores - np.max(raw_scores))
+        probabilities = exp_shifted / exp_shifted.sum()
+        
+        # 4. Extract Classification Labels
+        top_idx = int(np.argmax(probabilities))
+        short_code, diagnosis_label = DISEASE_MAP[top_idx]
+        confidence = float(probabilities[top_idx]) * 100
+
+        # 5. Connect Triage Synthesis Layer via Gemini API
+        prompt = f"""
+        You are an expert clinical dermatological companion. A localized deep learning ONNX model has categorized a patient's skin lesion.
+        
+        Model Output Classification: {diagnosis_label} (Short code: {short_code})
+        Calculated Prediction Confidence: {confidence:.2f}%
+        Reported Patient Symptoms: {symptoms}
+        
+        Provide an organized clinical context evaluation explaining what these visual details typically imply, 
+        morphological variables that demand immediate evaluation, and recommended secondary routing procedures.
+        """
+        
+        try:
+            llm = genai.GenerativeModel("gemini-2.5-flash")
+            response = llm.generate_content(prompt)
+            ai_insights = response.text
+        except Exception as gemini_err:
+            ai_insights = f"Generative backup context failure. Diagnostic fallback preserved: {diagnosis_label}."
+
+        return {
+            "short_code": short_code,
+            "diagnosis": diagnosis_label,
+            "confidence_score": f"{confidence:.2f}%",
+            "triage_insights": ai_insights
+        }
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Pipeline Error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Inference execution failure: {str(e)}")
